@@ -1,0 +1,19 @@
+User-agent: *
+Allow: /
+
+# Block sensitive areas
+Disallow: /admin/
+Disallow: /faculty/
+Disallow: /student/
+Disallow: /profile/
+Disallow: /auth/
+Disallow: /includes/
+Disallow: /config/
+Disallow: /uploads/private/
+
+# Allow public assets
+Allow: /assets/
+Allow: /uploads/public/
+
+# Sitemap
+Sitemap: https://yourdomain.com/sitemap.xml

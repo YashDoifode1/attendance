@@ -1,0 +1,23 @@
+ErrorDocument 400 https://qrbasedattendance.gt.tc/pages/400.php
+ErrorDocument 401 https://qrbasedattendance.gt.tc/pages/401.php
+ErrorDocument 403 https://qrbasedattendance.gt.tc/pages/403.php
+ErrorDocument 404 https://qrbasedattendance.gt.tc/pages/404.php
+ErrorDocument 405 https://qrbasedattendance.gt.tc/pages/405.php
+ErrorDocument 408 https://qrbasedattendance.gt.tc/pages/408.php
+ErrorDocument 500 https://qrbasedattendance.gt.tc/pages/500.php
+ErrorDocument 502 https://qrbasedattendance.gt.tc/pages/502.php
+ErrorDocument 503 https://qrbasedattendance.gt.tc/pages/503.php
+
+
+DB_HOST=sql305.infinityfree.com
+DB_NAME=if0_40911192_qrbase
+DB_USER=if0_40911192
+DB_PASS=ax7VQjafwA96T
+
+SECRET_KEY=your_secret_key_here
+INSTITUTION_ID=INST001
+QR_EXPIRY_MINUTES=10
+
+
+APP_NAME=Professional Web Consultant
+APP_URL=https://qrbasedattendance.gt.tc

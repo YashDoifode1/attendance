@@ -1,0 +1,21 @@
+/* TEAM */
+Developer: Yash Doifode
+Role: Full Stack Developer
+Location: India
+Contact: 
+
+/* PROJECT */
+Project: QR Based Attendance Management System
+Description: Secure QR-based attendance tracking system for institutions.
+Technologies: PHP, MySQL, Bootstrap 5, JavaScript
+Version: 1.0.0
+
+/* THANKS */
+Bootstrap Team
+PHP Community
+Open Source Contributors
+
+/* SITE */
+Last Updated: 2026-01-15
+Language: English
+Standards: HTML5, CSS3
