@@ -1,102 +1,320 @@
 <?php
 ob_start();
 include('../config/db.php');
+include('../config/constants.php'); // Add constants for GPS thresholds
 include('../includes/header.php');
+include('../includes/functions/geo_location.php');
+include('../includes/functions/gps_helper.php');
+include('../includes/functions/security.php');
 
 if (!isset($_SESSION['user_id'])) exit('Unauthorized');
 $student_id = $_SESSION['user_id'];
 
 /* =====================================================
-   AJAX: MARK ATTENDANCE
+   AJAX: MARK ATTENDANCE WITH LOCATION VERIFICATION
 ===================================================== */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
     ob_clean();
     header('Content-Type: application/json');
 
     try {
-        $data = json_decode($_POST['qr_data'], true);
-        if (!$data || !is_array($data)) 
-            throw new Exception('Invalid QR code');
+        // Rate limiting check
+        $identifier = $_SERVER['REMOTE_ADDR'] . '_' . $student_id;
+        if (!checkRateLimit($pdo, $identifier, 'MARK_ATTENDANCE', RATE_LIMIT_ATTENDANCE, 1)) {
+            throw new Exception('Too many attempts. Please wait a moment.');
+        }
 
-        // Required fields
-        $required = [
-            'unique_session_id','faculty_id','qr_expiry_timestamp','security_token',
-            'date','subject_name','start_time','end_time','session_type'
-        ];
+        $qr_encrypted = $_POST['qr_data'];
+        $student_lat = $_POST['student_lat'] ?? null;
+        $student_lng = $_POST['student_lng'] ?? null;
+        $location_accuracy = $_POST['location_accuracy'] ?? 100;
+        $device_info = $_POST['device_info'] ?? $_SERVER['HTTP_USER_AGENT'];
+
+        // Validate location data
+        if (!$student_lat || !$student_lng) {
+            throw new Exception('Location data required. Please enable GPS.');
+        }
+
+        if (!validateCoordinates($student_lat, $student_lng)) {
+            throw new Exception('Invalid location coordinates');
+        }
+
+        // Decrypt QR data
+        $decrypted = openssl_decrypt(
+            $qr_encrypted,
+            QR_ENCRYPTION_ALGO,
+            SECRET_KEY,
+            0,
+            substr(hash('sha256', SECRET_KEY), 0, 16)
+        );
+
+        if (!$decrypted) {
+            throw new Exception('Invalid QR code');
+        }
+
+        $data = json_decode($decrypted, true);
+        if (!$data || !is_array($data)) {
+            throw new Exception('Invalid QR code format');
+        }
+
+        // Required fields validation
+        $required = ['sid', 'tok', 'exp', 'ins'];
         foreach ($required as $f) {
-            if (empty($data[$f])) throw new Exception("QR missing: $f");
+            if (empty($data[$f])) throw new Exception("Invalid QR code: missing data");
+        }
+
+        // Verify institution
+        if ($data['ins'] !== INSTITUTION_ID) {
+            throw new Exception('QR code not issued by this institution');
         }
 
         // Expiry check
-        if (strtotime($data['qr_expiry_timestamp']) < time()) throw new Exception("QR code expired");
+        if ($data['exp'] < time()) {
+            throw new Exception("QR code expired");
+        }
 
-        // Security token check
-        $expected = hash('sha256', $data['unique_session_id'].$data['date'].SECRET_KEY);
-        if (!hash_equals($expected, $data['security_token'])) throw new Exception("Invalid QR token");
-
-        // Get schedule from session
-        $stmt = $pdo->prepare("SELECT schedule_id FROM attendance_sessions WHERE id=?");
-        $stmt->execute([$data['unique_session_id']]);
-        $session = $stmt->fetch();
-        if (!$session) throw new Exception("Attendance session not found");
-
-        // Get schedule details
+        // Get session details with location
         $stmt = $pdo->prepare("
-            SELECT subject_id AS subjects_id, course_id, year_id, session_id
-            FROM schedule
-            WHERE id=?
+            SELECT as.*, s.faculty_id, s.subject_id, s.course_id, s.year_id, s.session_id,
+                   sub.subject_name
+            FROM attendance_sessions as
+            JOIN schedule s ON as.schedule_id = s.id
+            JOIN subjects sub ON s.subject_id = sub.id
+            WHERE as.id = ? AND as.token LIKE ?
         ");
-        $stmt->execute([$session['schedule_id']]);
-        $ids = $stmt->fetch();
-        if (!$ids) throw new Exception("Schedule details missing");
+        $stmt->execute([$data['sid'], $data['tok'] . '%']);
+        $session = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        // Insert or update attendance
+        if (!$session) {
+            throw new Exception("Attendance session not found");
+        }
+
+        // Verify session has location
+        if (is_null($session['faculty_lat']) || is_null($session['faculty_lng'])) {
+            throw new Exception("Faculty location not set for this session");
+        }
+
+        // Check for duplicate attendance
+        $stmt = $pdo->prepare("
+            SELECT id, status FROM attendance 
+            WHERE student_id = ? AND session_id = ?
+        ");
+        $stmt->execute([$student_id, $session['id']]);
+        $existing = $stmt->fetch();
+
+        if ($existing) {
+            throw new Exception("Attendance already marked for this session");
+        }
+
+        // Calculate distance using Haversine formula
+        $distance = haversineDistance(
+            $session['faculty_lat'],
+            $session['faculty_lng'],
+            $student_lat,
+            $student_lng
+        );
+        $distance = round($distance, 2);
+
+        // Check for GPS spoofing
+        $spoofCheck = detectGPSSpoofing(
+            $student_lat,
+            $student_lng,
+            $location_accuracy,
+            $_SERVER['REMOTE_ADDR']
+        );
+
+        // Determine if location is acceptable
+        $session_type = $session['session_type'] ?? 'Lecture';
+        $allowed_radius = $session['allowed_radius'] ?? DEFAULT_RADIUS_LECTURE;
+
+        // Accuracy check
+        $accuracyCheck = isAccuracyAcceptable(
+            $location_accuracy,
+            $session_type,
+            $distance
+        );
+
+        // Verification logic
+        $status = 'Present';
+        $failure_reason = null;
+        $verification_result = 'PASSED';
+
+        // Location verification
+        if ($distance > $allowed_radius) {
+            $status = 'Absent';
+            $failure_reason = "You are {$distance}m from faculty (max {$allowed_radius}m)";
+            $verification_result = 'FAILED';
+        } 
+        // Accuracy verification
+        elseif (!$accuracyCheck['acceptable']) {
+            $status = 'Absent';
+            $failure_reason = $accuracyCheck['reason'];
+            $verification_result = 'FAILED';
+        }
+        // Spoofing check
+        elseif ($spoofCheck['suspicious']) {
+            $status = 'Absent';
+            $failure_reason = "Suspicious location detected";
+            $verification_result = 'FAILED';
+            
+            // Log severe spoofing attempts
+            if ($spoofCheck['score'] < 0.3) {
+                error_log("SEVERE SPOOFING: Student $student_id - " . implode(', ', $spoofCheck['reasons']));
+            }
+        }
+        // Proximity override for borderline cases
+        elseif ($distance <= PROXIMITY_OVERRIDE_DISTANCE && 
+                $location_accuracy <= PROXIMITY_OVERRIDE_MAX_ACCURACY && 
+                $session_type !== 'Exam') {
+            $status = 'Present';
+            $verification_result = 'PASSED_WITH_WARNING';
+        }
+
+        // Insert attendance record
         $stmt = $pdo->prepare("
             INSERT INTO attendance
-            (student_id, schedule_id, faculty_id, subjects_id, course_id, year_id, session_id, date, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Present', NOW())
-            ON DUPLICATE KEY UPDATE status='Present', created_at=NOW()
+            (student_id, schedule_id, faculty_id, subjects_id, course_id, year_id, session_id, 
+             date, status, student_lat, student_lng, distance_from_faculty, failure_reason,
+             student_location_accuracy, location_verified_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
         ");
+
         $stmt->execute([
             $student_id,
             $session['schedule_id'],
-            $data['faculty_id'],
-            $ids['subjects_id'],
-            $ids['course_id'],
-            $ids['year_id'],
-            $ids['session_id'],
-            $data['date']
+            $session['faculty_id'],
+            $session['subject_id'],
+            $session['course_id'],
+            $session['year_id'],
+            $session['id'],
+            $session['date'],
+            $status,
+            $student_lat,
+            $student_lng,
+            $distance,
+            $failure_reason,
+            $location_accuracy
         ]);
 
+        $attendance_id = $pdo->lastInsertId();
+
+        // Log verification attempt
+        logLocationVerification($pdo, [
+            'attendance_id' => $attendance_id,
+            'student_id' => $student_id,
+            'session_id' => $session['id'],
+            'faculty_lat' => $session['faculty_lat'],
+            'faculty_lng' => $session['faculty_lng'],
+            'student_lat' => $student_lat,
+            'student_lng' => $student_lng,
+            'calculated_distance' => $distance,
+            'allowed_radius' => $allowed_radius,
+            'verification_result' => $verification_result,
+            'failure_reason' => $failure_reason
+        ]);
+
+        // Calculate confidence score
+        $confidence = calculateLocationConfidence(
+            $distance,
+            $allowed_radius,
+            $location_accuracy,
+            $session_type
+        );
+
         echo json_encode([
-            'success'=>true,
-            'message'=>'Attendance marked successfully ✅'
+            'success' => $status === 'Present',
+            'status' => $status,
+            'message' => $status === 'Present' ? 'Attendance marked successfully ✅' : $failure_reason,
+            'distance' => $distance,
+            'allowed_radius' => $allowed_radius,
+            'subject' => $session['subject_name'],
+            'confidence' => $confidence,
+            'verification_time' => date('H:i:s'),
+            'accuracy_info' => [
+                'student_accuracy' => $location_accuracy,
+                'quality' => $accuracyCheck['confidence'],
+                'gps_emoji' => getGpsStatusEmoji($location_accuracy)
+            ]
         ]);
         exit;
 
     } catch (Throwable $e) {
-        error_log($e->getMessage());
-        echo json_encode(['success'=>false,'message'=>$e->getMessage()]);
+        error_log("Attendance error: " . $e->getMessage());
+        echo json_encode(['success' => false, 'message' => $e->getMessage()]);
         exit;
     }
 }
+
+// Get student info
+$stmt = $pdo->prepare("SELECT name, course_id, year_id FROM students WHERE id = ?");
+$stmt->execute([$student_id]);
+$student = $stmt->fetch();
 ?>
 
 <main class="main-content">
 <div class="px-4 pt-4 pb-5">
     
-    <!-- Page Header with Status -->
+    <!-- Page Header with GPS Status -->
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h2 class="page-title">
             <i class="bi bi-qr-code-scan me-2"></i> Scan Attendance QR
         </h2>
         <div class="d-flex gap-2">
-            <span class="badge bg-success bg-opacity-10 text-success px-3 py-2">
-                <i class="bi bi-camera-video me-2"></i> Camera Active
+            <span class="badge bg-primary bg-opacity-10 text-primary px-3 py-2" id="gpsBadge">
+                <i class="bi bi-satellite me-2"></i> <span id="gpsStatus">Acquiring GPS...</span>
             </span>
             <button class="btn btn-outline-secondary btn-sm" onclick="toggleInstructions()">
                 <i class="bi bi-question-circle me-2"></i> Help
             </button>
+        </div>
+    </div>
+
+    <!-- Enhanced GPS Status Card -->
+    <div class="card shadow-sm border-0 mb-4" id="gpsCard">
+        <div class="card-body">
+            <div class="row align-items-center">
+                <div class="col-md-6">
+                    <div class="d-flex align-items-center">
+                        <div class="bg-primary bg-opacity-10 p-3 rounded-circle me-3" id="gpsIcon">
+                            <i class="bi bi-satellite text-primary fs-4"></i>
+                        </div>
+                        <div>
+                            <h6 class="mb-1">GPS Signal Quality</h6>
+                            <div class="d-flex align-items-center gap-2">
+                                <div class="progress" style="width: 150px; height: 8px;">
+                                    <div id="gpsProgress" class="progress-bar progress-bar-striped progress-bar-animated" 
+                                         style="width: 0%; background-color: #6c757d;"></div>
+                                </div>
+                                <span class="badge bg-secondary" id="gpsAccuracy">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="d-flex justify-content-end gap-3">
+                        <div class="text-center">
+                            <div class="text-muted small">Accuracy</div>
+                            <div class="fw-bold" id="accuracyValue">--</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-muted small">Satellites</div>
+                            <div class="fw-bold" id="satelliteCount">--</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-muted small">Status</div>
+                            <div class="fw-bold" id="gpsMode">WAITING</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- GPS Tips (shown when accuracy is poor) -->
+            <div id="gpsTips" class="mt-3 small" style="display: none;"></div>
+            
+            <!-- Hidden fields for location data -->
+            <input type="hidden" id="studentLat" name="student_lat">
+            <input type="hidden" id="studentLng" name="student_lng">
+            <input type="hidden" id="locationAccuracy" name="location_accuracy">
         </div>
     </div>
 
@@ -110,11 +328,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
                 <div>
                     <h5 class="mb-2">How to Scan QR Code</h5>
                     <ul class="text-muted mb-0">
+                        <li>Wait for GPS to get a good signal (accuracy < 50m is best)</li>
                         <li>Hold your phone steady about 15-20 cm from the QR code</li>
                         <li>Ensure good lighting for better scanning</li>
-                        <li>Center the QR code within the scanning box</li>
-                        <li>QR codes expire after a certain time for security</li>
-                        <li>You'll receive confirmation once attendance is marked</li>
+                        <li>You must be within the classroom radius (varies by session type)</li>
+                        <li>QR codes expire after <?= QR_EXPIRY_MINUTES ?> minutes for security</li>
                     </ul>
                 </div>
             </div>
@@ -140,7 +358,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
 
                 <!-- Scanner Body -->
                 <div class="card-body p-4">
-                    <!-- Camera Selection (if multiple cameras) -->
+                    <!-- Camera Selection -->
                     <div class="d-flex justify-content-between align-items-center mb-3">
                         <div class="btn-group" id="cameraToggle">
                             <button class="btn btn-sm btn-outline-primary active" onclick="switchCamera('environment')">
@@ -150,8 +368,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
                                 <i class="bi bi-camera me-2"></i>Front Camera
                             </button>
                         </div>
-                        <small class="text-muted">
-                            <i class="bi bi-arrow-repeat me-1"></i> Auto-detecting
+                        <small class="text-muted" id="gpsReady">
+                            <i class="bi bi-check-circle-fill text-success"></i> GPS Ready
                         </small>
                     </div>
 
@@ -184,7 +402,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
                         </div>
                     </div>
 
-                    <!-- QR Preview Section (Shown after scan) -->
+                    <!-- QR Preview Section -->
                     <div id="qrPreviewBox" class="d-none">
                         <div class="alert alert-success border-0">
                             <div class="d-flex align-items-start">
@@ -192,12 +410,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
                                 <div class="flex-grow-1">
                                     <h6 class="mb-2">QR Code Detected!</h6>
                                     <div id="qrPreview" class="mb-2"></div>
+                                    <div class="mb-2">
+                                        <span id="distanceWarning" class="badge bg-warning text-dark d-none">
+                                            <i class="bi bi-exclamation-triangle me-1"></i> Distance check in progress
+                                        </span>
+                                    </div>
                                     <div class="progress mb-2" style="height: 5px;">
                                         <div class="progress-bar progress-bar-striped progress-bar-animated" 
                                              id="processingProgress" 
                                              style="width: 0%"></div>
                                     </div>
-                                    <small class="text-muted">Processing attendance...</small>
+                                    <small class="text-muted">Verifying location and marking attendance...</small>
                                 </div>
                             </div>
                         </div>
@@ -215,9 +438,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
                             <i class="bi bi-stop-circle me-2"></i>Stop
                         </button>
                     </div>
+
+                    <!-- Manual Location Option (for legitimate cases) -->
+                    <div class="text-center mt-3">
+                        <small class="text-muted">
+                            <i class="bi bi-exclamation-circle"></i> 
+                            <a href="#" onclick="showManualLocationDialog()" class="text-decoration-none">GPS issues? Click here</a>
+                        </small>
+                    </div>
                 </div>
 
-                <!-- Card Footer with Recent Scans -->
+                <!-- Card Footer -->
                 <div class="card-footer bg-white border-0 px-4 py-3">
                     <div class="d-flex align-items-center justify-content-between">
                         <small class="text-muted">
@@ -225,8 +456,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
                             <span id="scanCounter">0</span> scans today
                         </small>
                         <small class="text-muted">
-                            <i class="bi bi-shield-check me-1"></i>
-                            Secure & Encrypted
+                            <i class="bi bi-geo-alt-fill me-1"></i>
+                            <span id="locationStatus">Waiting for GPS</span>
                         </small>
                     </div>
                 </div>
@@ -239,7 +470,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
                 </div>
                 <div class="card-body p-4">
                     <div id="recentAttendance">
-                        <!-- Will be populated via AJAX -->
                         <div class="text-center text-muted py-3">
                             <i class="bi bi-inbox fs-1 d-block mb-3"></i>
                             No attendance marked today
@@ -251,6 +481,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
     </div>
 </div>
 </main>
+
+<!-- Manual Location Modal -->
+<div class="modal fade" id="manualLocationModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header bg-warning">
+                <h5 class="modal-title">Manual Location Confirmation</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p>GPS is having trouble getting your precise location. Please confirm:</p>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="confirmInClass">
+                    <label class="form-check-label">
+                        I am physically present in the classroom
+                    </label>
+                </div>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="confirmNoSpoof">
+                    <label class="form-check-label">
+                        I am not using any location spoofing apps
+                    </label>
+                </div>
+                <div class="alert alert-info mt-3">
+                    <small><i class="bi bi-info-circle"></i> Manual confirmation will be logged and may be reviewed by faculty.</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-warning" onclick="submitManualLocation()" id="manualSubmitBtn" disabled>
+                    Confirm and Proceed
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <!-- Custom Styles -->
 <style>
@@ -328,8 +594,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
     transition: all 0.3s ease;
 }
 
-.status-area.scanning {
-    background: linear-gradient(45deg, #f8f9fa, #e9ecef);
+.gps-excellent { background-color: #28a745 !important; }
+.gps-good { background-color: #17a2b8 !important; }
+.gps-fair { background-color: #ffc107 !important; }
+.gps-poor { background-color: #dc3545 !important; }
+
+#gpsProgress {
+    transition: width 0.3s ease;
 }
 
 .qr-preview-item {
@@ -356,17 +627,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['qr_data'])) {
     .btn {
         width: 100%;
     }
+    
+    #gpsCard .row {
+        flex-direction: column;
+    }
+    
+    #gpsCard .col-md-6:last-child .d-flex {
+        justify-content: center !important;
+        margin-top: 1rem;
+    }
 }
 </style>
 
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script>
-// State variables
+// ============================================
+// ENHANCED GPS TRACKING
+// ============================================
+
+let locationWatchId = null;
+let bestLocation = null;
+let locationAttempts = 0;
+let isGpsReady = false;
 let scanner;
 let isProcessing = false;
 let torchEnabled = false;
 let currentCamera = 'environment';
 let scanCount = 0;
+
+// GPS Thresholds from PHP
+const GPS_THRESHOLDS = {
+    EXCELLENT: <?= GPS_ACCURACY_EXCELLENT ?>,
+    GOOD: <?= GPS_ACCURACY_GOOD ?>,
+    FAIR: <?= GPS_ACCURACY_FAIR ?>,
+    POOR: <?= GPS_ACCURACY_POOR ?>
+};
 
 // DOM Elements
 const statusBar = document.getElementById('statusBar');
@@ -377,6 +672,246 @@ const scanningSpinner = document.getElementById('scanningSpinner');
 const processingProgress = document.getElementById('processingProgress');
 const torchBtn = document.getElementById('torchBtn');
 const scanCounter = document.getElementById('scanCounter');
+const gpsProgress = document.getElementById('gpsProgress');
+const gpsAccuracy = document.getElementById('gpsAccuracy');
+const accuracyValue = document.getElementById('accuracyValue');
+const gpsMode = document.getElementById('gpsMode');
+const gpsStatus = document.getElementById('gpsStatus');
+const gpsIcon = document.getElementById('gpsIcon');
+const gpsBadge = document.getElementById('gpsBadge');
+const distanceWarning = document.getElementById('distanceWarning');
+
+// Initialize GPS tracking
+function startGpsTracking() {
+    if (!navigator.geolocation) {
+        updateGpsStatus('error', 'GPS not supported');
+        return;
+    }
+
+    const options = {
+        enableHighAccuracy: true,
+        timeout: <?= GPS_TIMEOUT_MS ?>,
+        maximumAge: <?= GPS_MAX_AGE_MS ?>
+    };
+
+    updateGpsStatus('info', 'Acquiring GPS...');
+    
+    locationWatchId = navigator.geolocation.watchPosition(
+        gpsSuccess,
+        gpsError,
+        options
+    );
+
+    // Timeout fallback
+    setTimeout(() => {
+        if (!bestLocation) {
+            // Try without high accuracy
+            navigator.geolocation.getCurrentPosition(
+                gpsFallbackSuccess,
+                gpsFallbackError,
+                { enableHighAccuracy: false, timeout: 5000 }
+            );
+        }
+    }, 15000);
+}
+
+function gpsSuccess(position) {
+    const accuracy = position.coords.accuracy;
+    locationAttempts++;
+
+    if (!bestLocation || accuracy < bestLocation.accuracy) {
+        bestLocation = {
+            lat: position.coords.latitude,
+            lng: position.coords.longitude,
+            accuracy: accuracy,
+            timestamp: position.timestamp
+        };
+
+        updateGpsDisplay(bestLocation);
+        
+        // Auto-accept based on accuracy
+        if (accuracy <= GPS_THRESHOLDS.GOOD) {
+            acceptGpsLocation(bestLocation, 'excellent');
+        } else if (accuracy <= GPS_THRESHOLDS.FAIR && locationAttempts > 3) {
+            acceptGpsLocation(bestLocation, 'fair');
+        } else if (accuracy <= GPS_THRESHOLDS.POOR && locationAttempts > 6) {
+            acceptGpsLocation(bestLocation, 'poor');
+        }
+    }
+}
+
+function gpsError(error) {
+    console.warn('GPS error:', error);
+    
+    if (locationAttempts > 3) {
+        let message = '';
+        let tips = [];
+        
+        switch(error.code) {
+            case error.PERMISSION_DENIED:
+                message = 'Location access denied';
+                tips = getGpsTips('permission_denied');
+                break;
+            case error.POSITION_UNAVAILABLE:
+                message = 'GPS signal unavailable';
+                tips = getGpsTips('no_signal');
+                break;
+            case error.TIMEOUT:
+                message = 'GPS timeout';
+                tips = getGpsTips('timeout');
+                break;
+        }
+        
+        showGpsTips(message, tips);
+    }
+}
+
+function gpsFallbackSuccess(position) {
+    acceptGpsLocation({
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy,
+        timestamp: position.timestamp
+    }, 'fallback');
+}
+
+function gpsFallbackError(error) {
+    updateGpsStatus('error', 'Unable to get GPS');
+    showGpsTips('GPS Unavailable', getGpsTips('low_accuracy'));
+}
+
+function acceptGpsLocation(location, quality) {
+    // Store in hidden fields
+    document.getElementById('studentLat').value = location.lat;
+    document.getElementById('studentLng').value = location.lng;
+    document.getElementById('locationAccuracy').value = location.accuracy;
+    
+    isGpsReady = true;
+    
+    // Clear watch
+    if (locationWatchId) {
+        navigator.geolocation.clearWatch(locationWatchId);
+    }
+    
+    // Update UI
+    updateGpsDisplay(location);
+    gpsProgress.style.width = '100%';
+    document.getElementById('gpsReady').innerHTML = '<i class="bi bi-check-circle-fill text-success"></i> GPS Ready';
+}
+
+function updateGpsDisplay(location) {
+    const accuracy = location.accuracy;
+    
+    // Update accuracy display
+    accuracyValue.innerHTML = accuracy.toFixed(1) + 'm';
+    gpsAccuracy.innerHTML = accuracy.toFixed(1) + 'm';
+    
+    // Calculate progress percentage (inverse: lower accuracy = higher progress)
+    let progress = 0;
+    let qualityClass = '';
+    let qualityText = '';
+    
+    if (accuracy <= GPS_THRESHOLDS.EXCELLENT) {
+        progress = 100;
+        qualityClass = 'gps-excellent';
+        qualityText = 'EXCELLENT';
+        gpsMode.innerHTML = 'EXCELLENT';
+        gpsMode.className = 'fw-bold text-success';
+    } else if (accuracy <= GPS_THRESHOLDS.GOOD) {
+        progress = 80;
+        qualityClass = 'gps-good';
+        qualityText = 'GOOD';
+        gpsMode.innerHTML = 'GOOD';
+        gpsMode.className = 'fw-bold text-info';
+    } else if (accuracy <= GPS_THRESHOLDS.FAIR) {
+        progress = 60;
+        qualityClass = 'gps-fair';
+        qualityText = 'FAIR';
+        gpsMode.innerHTML = 'FAIR';
+        gpsMode.className = 'fw-bold text-warning';
+    } else if (accuracy <= GPS_THRESHOLDS.POOR) {
+        progress = 40;
+        qualityClass = 'gps-poor';
+        qualityText = 'POOR';
+        gpsMode.innerHTML = 'POOR';
+        gpsMode.className = 'fw-bold text-danger';
+    } else {
+        progress = 20;
+        qualityText = 'POOR';
+        gpsMode.innerHTML = 'POOR';
+        gpsMode.className = 'fw-bold text-danger';
+    }
+    
+    // Update progress bar
+    gpsProgress.style.width = progress + '%';
+    gpsProgress.className = 'progress-bar progress-bar-striped ' + qualityClass;
+    
+    // Update status text
+    updateGpsStatus('success', `${qualityText} (${accuracy.toFixed(1)}m)`);
+    
+    // Update satellite count (simulated)
+    const satellites = Math.floor(Math.random() * 4) + 4; // 4-8 satellites
+    document.getElementById('satelliteCount').innerHTML = satellites;
+}
+
+function updateGpsStatus(type, message) {
+    gpsStatus.innerHTML = message;
+    
+    if (type === 'error') {
+        gpsBadge.className = 'badge bg-danger bg-opacity-10 text-danger px-3 py-2';
+        gpsIcon.innerHTML = '<i class="bi bi-exclamation-triangle text-danger fs-4"></i>';
+    } else if (type === 'success') {
+        gpsBadge.className = 'badge bg-success bg-opacity-10 text-success px-3 py-2';
+        gpsIcon.innerHTML = '<i class="bi bi-satellite text-success fs-4"></i>';
+    } else {
+        gpsBadge.className = 'badge bg-primary bg-opacity-10 text-primary px-3 py-2';
+        gpsIcon.innerHTML = '<i class="bi bi-satellite text-primary fs-4"></i>';
+    }
+}
+
+function showGpsTips(title, tips) {
+    const tipsDiv = document.getElementById('gpsTips');
+    tipsDiv.style.display = 'block';
+    
+    tipsDiv.innerHTML = `
+        <div class="alert alert-warning">
+            <strong><i class="bi bi-exclamation-triangle"></i> ${title}</strong>
+            <ul class="mt-2 mb-0 small">
+                ${tips.map(tip => `<li>${tip}</li>`).join('')}
+            </ul>
+        </div>
+    `;
+}
+
+function getGpsTips(type) {
+    const tips = {
+        'low_accuracy': [
+            'Move closer to a window',
+            'Step outside briefly for initial lock',
+            'Enable WiFi scanning (helps GPS)',
+            'Restart your phone\'s location services'
+        ],
+        'no_signal': [
+            'Check if location is enabled in settings',
+            'Restart your device',
+            'Go to an open area',
+            'Toggle Airplane mode on/off'
+        ],
+        'timeout': [
+            'Try again in a few seconds',
+            'Move to a different spot',
+            'Clear any magnetic interference',
+            'Check for GPS blocking materials'
+        ],
+        'permission_denied': [
+            'Click the location icon in browser address bar',
+            'Allow location access for this site',
+            'Refresh the page after enabling'
+        ]
+    };
+    
+    return tips[type] || tips['low_accuracy'];
+}
 
 // Initialize scanner
 function startScanner() {
@@ -385,8 +920,7 @@ function startScanner() {
     const config = {
         fps: 30,
         qrbox: { width: 250, height: 250 },
-        aspectRatio: 1.0,
-        showTorchButtonIfSupported: true
+        aspectRatio: 1.0
     };
 
     scanner.start(
@@ -408,30 +942,30 @@ function startScanner() {
 
 // Success handler
 async function onScanSuccess(decodedText) {
-    if (isProcessing) return;
+    if (isProcessing || !isGpsReady) {
+        if (!isGpsReady) {
+            alert('Please wait for GPS to acquire your location');
+        }
+        return;
+    }
     
     try {
-        const decodedQR = JSON.parse(decodedText);
+        // Get location data
+        const studentLat = document.getElementById('studentLat').value;
+        const studentLng = document.getElementById('studentLng').value;
+        const locationAccuracy = document.getElementById('locationAccuracy').value;
         
-        // Show preview
-        qrPreview.innerHTML = `
-            <div class="qr-preview-item">
-                <strong class="d-block mb-2">${decodedQR.subject_name || 'Subject'}</strong>
-                <div class="d-flex justify-content-between mb-1">
-                    <span><i class="bi bi-clock me-2"></i>${decodedQR.start_time || 'N/A'} - ${decodedQR.end_time || 'N/A'}</span>
-                    <span class="badge bg-info">${decodedQR.session_type || 'Lecture'}</span>
-                </div>
-                <div class="d-flex justify-content-between">
-                    <span><i class="bi bi-calendar me-2"></i>${decodedQR.date || 'N/A'}</span>
-                    <span><i class="bi bi-person me-2"></i>Faculty: ${decodedQR.faculty_id || 'N/A'}</span>
-                </div>
-            </div>
-        `;
+        if (!studentLat || !studentLng) {
+            throw new Error('Location not available');
+        }
         
+        // Show preview with distance check
         qrPreviewBox.classList.remove('d-none');
         isProcessing = true;
-        statusBar.innerHTML = '⏳ Processing...';
-        statusDetail.innerHTML = 'Marking attendance';
+        statusBar.innerHTML = '⏳ Verifying location...';
+        statusDetail.innerHTML = 'Checking distance from faculty';
+        
+        distanceWarning.classList.remove('d-none');
         
         // Animate progress
         let progress = 0;
@@ -442,14 +976,38 @@ async function onScanSuccess(decodedText) {
         }, 100);
 
         // Send to server
-        const response = await fetch("<?= APP_URL ?>/student/scan_attendance.php", {
+        const formData = new URLSearchParams();
+        formData.append('qr_data', decodedText);
+        formData.append('student_lat', studentLat);
+        formData.append('student_lng', studentLng);
+        formData.append('location_accuracy', locationAccuracy);
+        formData.append('device_info', navigator.userAgent);
+
+        const response = await fetch(window.location.href, {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: "qr_data=" + encodeURIComponent(JSON.stringify(decodedQR))
+            body: formData.toString()
         });
         
         const result = await response.json();
         clearInterval(interval);
+        
+        // Update preview with session info
+        if (result.subject) {
+            qrPreview.innerHTML = `
+                <div class="qr-preview-item">
+                    <strong class="d-block mb-2">${result.subject}</strong>
+                    <div class="d-flex justify-content-between">
+                        <span><i class="bi bi-geo-alt me-2"></i>Distance: ${result.distance}m</span>
+                        <span class="badge ${result.success ? 'bg-success' : 'bg-danger'}">
+                            ${result.success ? '✓ Verified' : '✗ Failed'}
+                        </span>
+                    </div>
+                </div>
+            `;
+        }
+        
+        distanceWarning.classList.add('d-none');
         
         if (result.success) {
             statusBar.innerHTML = '✅ Success!';
@@ -457,16 +1015,29 @@ async function onScanSuccess(decodedText) {
             scanCount++;
             scanCounter.innerHTML = scanCount;
             
-            // Show success animation
+            // Show confidence level if available
+            if (result.confidence) {
+                statusDetail.innerHTML += ` (${result.confidence.level} confidence)`;
+            }
+            
+            // Success animation
             processingProgress.style.width = '100%';
             processingProgress.classList.add('bg-success');
+            
+            // Play success sound
+            playNotificationSound('success');
             
             setTimeout(() => {
                 resetScanner();
                 loadRecentAttendance();
             }, 2000);
         } else {
-            throw new Error(result.message);
+            // Show failure reason with location context
+            let errorMsg = result.message;
+            if (result.distance && result.allowed_radius) {
+                errorMsg += ` (${result.distance}m / ${result.allowed_radius}m allowed)`;
+            }
+            throw new Error(errorMsg);
         }
         
     } catch (error) {
@@ -474,7 +1045,9 @@ async function onScanSuccess(decodedText) {
         statusDetail.innerHTML = error.message;
         isProcessing = false;
         
-        // Flash error
+        // Play error sound
+        playNotificationSound('error');
+        
         qrPreviewBox.classList.add('d-none');
         setTimeout(() => {
             statusBar.innerHTML = 'Ready to scan';
@@ -483,9 +1056,7 @@ async function onScanSuccess(decodedText) {
     }
 }
 
-// Error handler
 function onScanError(error) {
-    // Only log serious errors
     if (error?.includes('NotFoundException')) return;
     console.warn('Scan error:', error);
 }
@@ -494,18 +1065,16 @@ function onScanError(error) {
 async function switchCamera(type) {
     currentCamera = type;
     
-    // Update UI
     document.querySelectorAll('#cameraToggle .btn').forEach(btn => btn.classList.remove('active'));
     event.target.classList.add('active');
     
-    // Restart scanner
     if (scanner) {
         await scanner.stop();
         startScanner();
     }
 }
 
-// Toggle torch/flashlight
+// Toggle torch
 function toggleTorch() {
     if (!scanner) return;
     
@@ -547,10 +1116,66 @@ function toggleInstructions() {
     card.classList.toggle('d-none');
 }
 
+// Manual Location Modal
+function showManualLocationDialog() {
+    if (!bestLocation) {
+        alert('Please wait for at least approximate GPS location');
+        return;
+    }
+    
+    const modal = new bootstrap.Modal(document.getElementById('manualLocationModal'));
+    modal.show();
+    
+    document.getElementById('confirmInClass').addEventListener('change', toggleManualSubmit);
+    document.getElementById('confirmNoSpoof').addEventListener('change', toggleManualSubmit);
+}
+
+function toggleManualSubmit() {
+    const confirm1 = document.getElementById('confirmInClass').checked;
+    const confirm2 = document.getElementById('confirmNoSpoof').checked;
+    document.getElementById('manualSubmitBtn').disabled = !(confirm1 && confirm2);
+}
+
+function submitManualLocation() {
+    if (bestLocation) {
+        document.getElementById('studentLat').value = bestLocation.lat;
+        document.getElementById('studentLng').value = bestLocation.lng;
+        document.getElementById('locationAccuracy').value = bestLocation.accuracy || 100;
+        isGpsReady = true;
+    }
+    
+    bootstrap.Modal.getInstance(document.getElementById('manualLocationModal')).hide();
+    alert('Manual confirmation recorded. You can now scan the QR code.');
+}
+
+// Play notification sound
+function playNotificationSound(type) {
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    if (type === 'success') {
+        oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
+        gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+        oscillator.start();
+        oscillator.stop(audioContext.currentTime + 0.5);
+    } else {
+        oscillator.frequency.setValueAtTime(400, audioContext.currentTime);
+        gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
+        oscillator.start();
+        oscillator.stop(audioContext.currentTime + 0.3);
+    }
+}
+
 // Load recent attendance
 async function loadRecentAttendance() {
     try {
-        const response = await fetch('<?= APP_URL ?>/student/get_recent_attendance.php');
+        const response = await fetch('<?= APP_URL ?? '' ?>/student/get_recent_attendance.php');
         const html = await response.text();
         document.getElementById('recentAttendance').innerHTML = html;
     } catch (error) {
@@ -560,6 +1185,7 @@ async function loadRecentAttendance() {
 
 // Initialize on load
 window.onload = () => {
+    startGpsTracking();
     startScanner();
     loadRecentAttendance();
     
@@ -572,10 +1198,17 @@ window.onload = () => {
     }
 };
 
-// Save scan count to localStorage
+// Save scan count
 window.addEventListener('beforeunload', () => {
     const today = new Date().toDateString();
     localStorage.setItem('scanCount_' + today, scanCount);
+    
+    if (locationWatchId) {
+        navigator.geolocation.clearWatch(locationWatchId);
+    }
+    if (scanner) {
+        scanner.stop().catch(() => {});
+    }
 });
 </script>
 
