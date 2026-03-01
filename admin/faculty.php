@@ -42,6 +42,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_faculty'])) {
     }
 }
 
+/* EDIT FACULTY */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_faculty'])) {
+    $id = intval($_POST['faculty_id']);
+    $name = trim($_POST['name']);
+    $email = trim($_POST['email']);
+    $password = trim($_POST['password']);
+    
+    if (!$name || !$email) {
+        $message = "Name and email are required.";
+        $alertType = "error";
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $message = "Invalid email format.";
+        $alertType = "error";
+    } else {
+        // Check if email exists for other users
+        $check = $pdo->prepare("SELECT COUNT(*) FROM students WHERE email = ? AND id != ?");
+        $check->execute([$email, $id]);
+        
+        if ($check->fetchColumn() > 0) {
+            $message = "Email already exists for another user.";
+            $alertType = "error";
+        } else {
+            if (!empty($password)) {
+                // Update with new password
+                $hash = password_hash($password, PASSWORD_BCRYPT);
+                $stmt = $pdo->prepare("UPDATE students SET name = ?, email = ?, password = ? WHERE id = ? AND role = 'faculty'");
+                $stmt->execute([$name, $email, $hash, $id]);
+            } else {
+                // Update without password
+                $stmt = $pdo->prepare("UPDATE students SET name = ?, email = ? WHERE id = ? AND role = 'faculty'");
+                $stmt->execute([$name, $email, $id]);
+            }
+            $message = "Faculty updated successfully.";
+            $alertType = "success";
+        }
+    }
+}
+
 /* DELETE FACULTY */
 if (isset($_GET['delete'])) {
     try {
@@ -61,6 +99,14 @@ if (isset($_GET['delete'])) {
         $message = "Error deleting faculty.";
         $alertType = "error";
     }
+}
+
+/* FETCH SINGLE FACULTY FOR EDIT */
+$editFaculty = null;
+if (isset($_GET['edit'])) {
+    $stmt = $pdo->prepare("SELECT id, name, email FROM students WHERE id = ? AND role = 'faculty'");
+    $stmt->execute([intval($_GET['edit'])]);
+    $editFaculty = $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
 /* FETCH FACULTY with their assigned courses */
@@ -223,7 +269,7 @@ include('includes/sidebar_header.php');
                                 <td class="py-3">
                                     <?php if ($f['course_count'] > 0): ?>
                                         <span class="badge" style="background: var(--sidebar-active); color: white; padding: 6px 12px; cursor: pointer;" 
-                                              onclick="showFacultyCourses(<?= $f['id'] ?>, '<?= htmlspecialchars($f['name']) ?>', '<?= htmlspecialchars($f['detailed_schedule']) ?>')">
+                                              onclick="showFacultyCourses(<?= $f['id'] ?>, '<?= htmlspecialchars(addslashes($f['name'])) ?>', '<?= htmlspecialchars(addslashes($f['detailed_schedule'])) ?>')">
                                             <?= $f['course_count'] ?> Course(s)
                                         </span>
                                     <?php else: ?>
@@ -245,20 +291,20 @@ include('includes/sidebar_header.php');
                                     </span>
                                 </td>
                                 <td class="pe-4 py-3 text-end">
-                                    <button class="btn btn-sm" style="background: transparent; color: var(--text-muted); border: 1px solid var(--border-color); margin-right: 5px;" 
+                                    <button class="btn btn-sm action-btn" style="background: transparent; color: var(--text-muted); border: 1px solid var(--border-color); margin-right: 5px;" 
                                             onclick="viewFaculty(<?= $f['id'] ?>)" title="View Details">
                                         <i class="bi bi-eye"></i>
                                     </button>
-                                    <button class="btn btn-sm" style="background: transparent; color: var(--text-muted); border: 1px solid var(--border-color); margin-right: 5px;" 
+                                    <button class="btn btn-sm action-btn" style="background: transparent; color: var(--text-muted); border: 1px solid var(--border-color); margin-right: 5px;" 
                                             onclick="editFaculty(<?= $f['id'] ?>)" title="Edit">
                                         <i class="bi bi-pencil"></i>
                                     </button>
-                                    <a href="?delete=<?= $f['id'] ?>" 
-                                       onclick="return confirmDelete(event, this)"
-                                       class="btn btn-sm" style="background: transparent; color: #ef4444; border: 1px solid var(--border-color);"
+                                    <button class="btn btn-sm action-btn" 
+                                       onclick="confirmDelete(<?= $f['id'] ?>, '<?= htmlspecialchars(addslashes($f['name'])) ?>')"
+                                       style="background: transparent; color: #ef4444; border: 1px solid var(--border-color);"
                                        title="Delete">
                                         <i class="bi bi-trash"></i>
-                                    </a>
+                                    </button>
                                 </td>
                             </tr>
                         <?php endforeach; ?>
@@ -284,36 +330,34 @@ include('includes/sidebar_header.php');
     </div>
 </div>
 
-<!-- Add Faculty Modal (Hidden by default) -->
-<div id="addFacultyModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 9999; align-items: center; justify-content: center;">
-    <div style="background: var(--card-bg); border-radius: 20px; width: 90%; max-width: 500px; border: 1px solid var(--border-color);">
-        <div class="p-4 border-bottom" style="border-color: var(--border-color) !important;">
-            <div class="d-flex justify-content-between align-items-center">
-                <h5 class="modal-title fw-bold" style="color: var(--text-primary);">
-                    <i class="bi bi-person-plus me-2" style="color: var(--sidebar-active);"></i>Add New Faculty
-                </h5>
-                <button class="btn-close btn-close-white" onclick="hideAddFacultyModal()"></button>
-            </div>
+<!-- Add Faculty Modal -->
+<div id="addFacultyModal" class="modal-overlay">
+    <div class="modal-container">
+        <div class="modal-header">
+            <h5 class="modal-title">
+                <i class="bi bi-person-plus me-2" style="color: var(--sidebar-active);"></i>Add New Faculty
+            </h5>
+            <button class="btn-close btn-close-white" onclick="hideAddFacultyModal()"></button>
         </div>
         <form method="POST" onsubmit="return validateFacultyForm()">
-            <div class="p-4">
+            <div class="modal-body">
                 <div class="mb-4">
-                    <label class="form-label" style="color: var(--text-secondary);">Full Name</label>
+                    <label class="form-label">Full Name</label>
                     <input type="text" name="name" id="facultyName" class="form-control" required placeholder="Enter full name">
                 </div>
                 <div class="mb-4">
-                    <label class="form-label" style="color: var(--text-secondary);">Email Address</label>
+                    <label class="form-label">Email Address</label>
                     <input type="email" name="email" id="facultyEmail" class="form-control" required placeholder="Enter email">
                 </div>
                 <div class="mb-4">
-                    <label class="form-label" style="color: var(--text-secondary);">Password</label>
+                    <label class="form-label">Password</label>
                     <input type="password" name="password" id="facultyPassword" class="form-control" required placeholder="Enter password">
                     <small style="color: var(--text-muted);">Minimum 6 characters</small>
                 </div>
             </div>
-            <div class="p-4 border-top" style="border-color: var(--border-color) !important; display: flex; gap: 10px; justify-content: flex-end;">
-                <button type="button" class="btn" style="background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-secondary); padding: 10px 24px;" onclick="hideAddFacultyModal()">Cancel</button>
-                <button type="submit" name="add_faculty" class="btn btn-primary" style="padding: 10px 24px;">
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="hideAddFacultyModal()">Cancel</button>
+                <button type="submit" name="add_faculty" class="btn btn-primary">
                     <i class="bi bi-plus-circle me-2"></i>Add Faculty
                 </button>
             </div>
@@ -321,37 +365,110 @@ include('includes/sidebar_header.php');
     </div>
 </div>
 
-<!-- View Faculty Modal (Hidden by default) -->
-<div id="viewFacultyModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 9999; align-items: center; justify-content: center;">
-    <div style="background: var(--card-bg); border-radius: 20px; width: 90%; max-width: 600px; border: 1px solid var(--border-color);">
-        <div class="p-4 border-bottom" style="border-color: var(--border-color) !important;">
-            <div class="d-flex justify-content-between align-items-center">
-                <h5 class="modal-title fw-bold" style="color: var(--text-primary);" id="viewModalTitle">Faculty Details</h5>
-                <button class="btn-close btn-close-white" onclick="hideViewFacultyModal()"></button>
-            </div>
+<!-- Edit Faculty Modal -->
+<?php if ($editFaculty): ?>
+<div id="editFacultyModal" class="modal-overlay" style="display: flex;">
+    <div class="modal-container">
+        <div class="modal-header">
+            <h5 class="modal-title">
+                <i class="bi bi-pencil-square me-2" style="color: var(--sidebar-active);"></i>Edit Faculty
+            </h5>
+            <a href="faculty.php" class="btn-close btn-close-white"></a>
         </div>
-        <div class="p-4" id="facultyDetailsContent">
+        <form method="POST" onsubmit="return validateEditForm()">
+            <input type="hidden" name="faculty_id" value="<?= $editFaculty['id'] ?>">
+            <div class="modal-body">
+                <div class="mb-4">
+                    <label class="form-label">Full Name</label>
+                    <input type="text" name="name" id="editName" class="form-control" required 
+                           value="<?= htmlspecialchars($editFaculty['name']) ?>" placeholder="Enter full name">
+                </div>
+                <div class="mb-4">
+                    <label class="form-label">Email Address</label>
+                    <input type="email" name="email" id="editEmail" class="form-control" required 
+                           value="<?= htmlspecialchars($editFaculty['email']) ?>" placeholder="Enter email">
+                </div>
+                <div class="mb-4">
+                    <label class="form-label">New Password (leave blank to keep current)</label>
+                    <input type="password" name="password" id="editPassword" class="form-control" placeholder="Enter new password">
+                    <small style="color: var(--text-muted);">Minimum 6 characters if changing</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <a href="faculty.php" class="btn btn-secondary">Cancel</a>
+                <button type="submit" name="edit_faculty" class="btn btn-primary">
+                    <i class="bi bi-check-circle me-2"></i>Update Faculty
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- View Faculty Modal -->
+<div id="viewFacultyModal" class="modal-overlay">
+    <div class="modal-container" style="max-width: 600px;">
+        <div class="modal-header">
+            <h5 class="modal-title" id="viewModalTitle">
+                <i class="bi bi-person-badge me-2" style="color: var(--sidebar-active);"></i>Faculty Details
+            </h5>
+            <button class="btn-close btn-close-white" onclick="hideViewFacultyModal()"></button>
+        </div>
+        <div class="modal-body" id="facultyDetailsContent">
             <!-- Content will be populated by JavaScript -->
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="hideViewFacultyModal()">Close</button>
+            <button class="btn btn-primary" id="editFromViewBtn" onclick="">Edit Faculty</button>
         </div>
     </div>
 </div>
 
-<!-- Courses Modal (Hidden by default) -->
-<div id="coursesModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 9999; align-items: center; justify-content: center;">
-    <div style="background: var(--card-bg); border-radius: 20px; width: 90%; max-width: 700px; border: 1px solid var(--border-color);">
-        <div class="p-4 border-bottom" style="border-color: var(--border-color) !important;">
-            <div class="d-flex justify-content-between align-items-center">
-                <h5 class="modal-title fw-bold" style="color: var(--text-primary);" id="coursesModalTitle">Faculty Courses</h5>
-                <button class="btn-close btn-close-white" onclick="hideCoursesModal()"></button>
-            </div>
+<!-- Courses Modal -->
+<div id="coursesModal" class="modal-overlay">
+    <div class="modal-container" style="max-width: 700px;">
+        <div class="modal-header">
+            <h5 class="modal-title" id="coursesModalTitle">
+                <i class="bi bi-book me-2" style="color: var(--sidebar-active);"></i>Faculty Courses
+            </h5>
+            <button class="btn-close btn-close-white" onclick="hideCoursesModal()"></button>
         </div>
-        <div class="p-4" id="coursesModalContent">
+        <div class="modal-body" id="coursesModalContent">
             <!-- Content will be populated by JavaScript -->
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="hideCoursesModal()">Close</button>
         </div>
     </div>
 </div>
 
-<!-- JavaScript (All self-contained) -->
+<!-- Delete Confirmation Modal -->
+<div id="deleteConfirmModal" class="modal-overlay">
+    <div class="modal-container" style="max-width: 450px;">
+        <div class="modal-header" style="border-bottom-color: #ef4444;">
+            <h5 class="modal-title" style="color: #ef4444;">
+                <i class="bi bi-exclamation-triangle me-2"></i>Confirm Delete
+            </h5>
+            <button class="btn-close btn-close-white" onclick="hideDeleteModal()"></button>
+        </div>
+        <div class="modal-body text-center py-4">
+            <i class="bi bi-person-x" style="font-size: 4rem; color: #ef4444; opacity: 0.5;"></i>
+            <h5 class="mt-3" id="deleteFacultyName" style="color: var(--text-primary);"></h5>
+            <p style="color: var(--text-muted);">
+                Are you sure you want to delete this faculty member?<br>
+                This action cannot be undone.
+            </p>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="hideDeleteModal()">Cancel</button>
+            <a href="#" id="confirmDeleteBtn" class="btn" style="background: #ef4444; color: white; border: none;">
+                <i class="bi bi-trash me-2"></i>Delete Faculty
+            </a>
+        </div>
+    </div>
+</div>
+
+<!-- JavaScript -->
 <script>
 // ==================== MODAL FUNCTIONS ====================
 
@@ -379,6 +496,14 @@ function hideCoursesModal() {
     document.getElementById('coursesModal').style.display = 'none';
 }
 
+function showDeleteModal() {
+    document.getElementById('deleteConfirmModal').style.display = 'flex';
+}
+
+function hideDeleteModal() {
+    document.getElementById('deleteConfirmModal').style.display = 'none';
+}
+
 // ==================== FORM VALIDATION ====================
 
 function validateFacultyForm() {
@@ -396,7 +521,7 @@ function validateFacultyForm() {
         return false;
     }
     
-    if (!email.includes('@') || !email.includes('.')) {
+    if (!isValidEmail(email)) {
         alert('Please enter a valid email address');
         return false;
     }
@@ -414,10 +539,57 @@ function validateFacultyForm() {
     return true;
 }
 
+function validateEditForm() {
+    const name = document.getElementById('editName').value.trim();
+    const email = document.getElementById('editEmail').value.trim();
+    const password = document.getElementById('editPassword').value;
+    
+    if (name === '') {
+        alert('Please enter faculty name');
+        return false;
+    }
+    
+    if (email === '') {
+        alert('Please enter email address');
+        return false;
+    }
+    
+    if (!isValidEmail(email)) {
+        alert('Please enter a valid email address');
+        return false;
+    }
+    
+    if (password !== '' && password.length < 6) {
+        alert('Password must be at least 6 characters long if changing');
+        return false;
+    }
+    
+    return true;
+}
+
+function isValidEmail(email) {
+    return email.includes('@') && email.includes('.');
+}
+
 // ==================== VIEW FACULTY DETAILS ====================
 
 function viewFaculty(id) {
-    // Get faculty data from the table row
+    fetch(`get_faculty_details.php?id=${id}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                displayFacultyDetails(data.faculty);
+            } else {
+                alert('Error loading faculty details');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            loadFacultyFromRow(id);
+        });
+}
+
+function loadFacultyFromRow(id) {
     const row = document.querySelector(`tr[data-faculty-id="${id}"]`);
     if (!row) return;
     
@@ -427,113 +599,120 @@ function viewFaculty(id) {
     const status = row.querySelector('td:nth-child(6) .badge').textContent.trim();
     const courseCount = row.querySelector('td:nth-child(4) .badge')?.textContent || '0 Course(s)';
     
-    document.getElementById('viewModalTitle').innerHTML = `<i class="bi bi-person-badge me-2" style="color: var(--sidebar-active);"></i>${name}`;
+    displayFacultyDetails({
+        id: id,
+        name: name,
+        email: email,
+        created_at: joined,
+        course_count: parseInt(courseCount),
+        status: status.toLowerCase()
+    });
+}
+
+function displayFacultyDetails(faculty) {
+    document.getElementById('viewModalTitle').innerHTML = `
+        <i class="bi bi-person-badge me-2" style="color: var(--sidebar-active);"></i>${faculty.name}
+    `;
     
     document.getElementById('facultyDetailsContent').innerHTML = `
         <div class="text-center mb-4">
             <div class="user-avatar mx-auto mb-3" style="width: 80px; height: 80px; font-size: 1.8rem;">
-                ${name.charAt(0).toUpperCase()}
+                ${faculty.name.charAt(0).toUpperCase()}
             </div>
-            <h5 style="color: var(--text-primary);">${name}</h5>
-            <p style="color: var(--sidebar-active);">${email}</p>
+            <h5 style="color: var(--text-primary);">${faculty.name}</h5>
+            <p style="color: var(--sidebar-active);">${faculty.email}</p>
         </div>
         
         <div class="row g-4">
             <div class="col-md-6">
                 <div class="p-3 rounded-3" style="background: var(--sidebar-bg);">
                     <small class="text-muted d-block mb-2">Joined Date</small>
-                    <span style="color: var(--text-primary);">${joined}</span>
+                    <span style="color: var(--text-primary);">${new Date(faculty.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</span>
                 </div>
             </div>
             <div class="col-md-6">
                 <div class="p-3 rounded-3" style="background: var(--sidebar-bg);">
                     <small class="text-muted d-block mb-2">Status</small>
-                    <span class="badge bg-${status.toLowerCase() === 'active' ? 'success' : 'secondary'}" 
-                          style="color: ${status.toLowerCase() === 'active' ? 'var(--success)' : 'var(--text-muted)'}">
-                        ${status}
+                    <span class="badge bg-${faculty.status === 'active' ? 'success' : 'secondary'}" 
+                          style="color: ${faculty.status === 'active' ? 'var(--success)' : 'var(--text-muted)'}">
+                        ${faculty.status}
                     </span>
                 </div>
             </div>
             <div class="col-12">
                 <div class="p-3 rounded-3" style="background: var(--sidebar-bg);">
                     <small class="text-muted d-block mb-2">Courses Assigned</small>
-                    <span style="color: var(--text-primary);">${courseCount}</span>
+                    <span style="color: var(--text-primary);">${faculty.course_count || 0} Course(s)</span>
                 </div>
             </div>
         </div>
-        
-        <div class="mt-4 d-flex gap-2 justify-content-end">
-            <button class="btn" style="background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-secondary);" onclick="hideViewFacultyModal()">Close</button>
-            <button class="btn btn-primary" onclick="editFaculty(${id})">Edit Faculty</button>
-        </div>
     `;
+    
+    document.getElementById('editFromViewBtn').onclick = function() {
+        hideViewFacultyModal();
+        editFaculty(faculty.id);
+    };
     
     showViewFacultyModal();
-}
-
-// ==================== SHOW FACULTY COURSES ====================
-
-function showFacultyCourses(id, name, scheduleData) {
-    document.getElementById('coursesModalTitle').innerHTML = `<i class="bi bi-book me-2" style="color: var(--sidebar-active);"></i>${name}'s Courses`;
-    
-    let coursesHtml = '';
-    
-    if (scheduleData) {
-        const courses = scheduleData.split('||');
-        coursesHtml = courses.map(course => {
-            if (!course) return '';
-            return `
-                <tr>
-                    <td class="py-2">${course}</td>
-                </tr>
-            `;
-        }).join('');
-    }
-    
-    document.getElementById('coursesModalContent').innerHTML = `
-        <?php if ($f['course_count'] > 0): ?>
-            <div class="table-responsive">
-                <table class="table" style="color: var(--text-primary);">
-                    <thead>
-                        <tr style="border-bottom: 1px solid var(--border-color);">
-                            <th class="ps-0">Course Schedule</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${coursesHtml || '<tr><td class="text-center py-3" style="color: var(--text-muted);">No detailed schedule available</td></tr>'}
-                    </tbody>
-                </table>
-            </div>
-        <?php else: ?>
-            <div class="text-center py-4">
-                <i class="bi bi-book" style="color: var(--text-muted); font-size: 3rem;"></i>
-                <p class="mt-2" style="color: var(--text-muted);">No courses assigned yet</p>
-            </div>
-        <?php endif; ?>
-        
-        <div class="mt-4 text-end">
-            <button class="btn" style="background: var(--card-bg); border: 1px solid var(--border-color); color: var(--text-secondary);" onclick="hideCoursesModal()">Close</button>
-        </div>
-    `;
-    
-    showCoursesModal();
 }
 
 // ==================== EDIT FACULTY ====================
 
 function editFaculty(id) {
-    // Redirect to edit page or show edit form
-    window.location.href = `edit_faculty.php?id=${id}`;
+    window.location.href = `faculty.php?edit=${id}`;
 }
 
-// ==================== DELETE CONFIRMATION ====================
+// ==================== DELETE FACULTY ====================
 
-function confirmDelete(event, element) {
-    event.preventDefault();
-    if (confirm('Delete this faculty member? This action cannot be undone and may affect schedule assignments.')) {
-        window.location.href = element.href;
+function confirmDelete(id, name) {
+    document.getElementById('deleteFacultyName').textContent = name;
+    document.getElementById('confirmDeleteBtn').href = `?delete=${id}`;
+    showDeleteModal();
+}
+
+// ==================== SHOW FACULTY COURSES ====================
+
+function showFacultyCourses(id, name, scheduleData) {
+    document.getElementById('coursesModalTitle').innerHTML = `
+        <i class="bi bi-book me-2" style="color: var(--sidebar-active);"></i>${name}'s Courses
+    `;
+    
+    let coursesHtml = '';
+    
+    if (scheduleData && scheduleData !== 'null') {
+        const courses = scheduleData.split('||');
+        courses.forEach(course => {
+            if (course) {
+                coursesHtml += `
+                    <tr>
+                        <td class="py-2">${course}</td>
+                    </tr>
+                `;
+            }
+        });
     }
-    return false;
+    
+    document.getElementById('coursesModalContent').innerHTML = coursesHtml ? `
+        <div class="table-responsive">
+            <table class="table" style="color: var(--text-primary);">
+                <thead>
+                    <tr style="border-bottom: 1px solid var(--border-color);">
+                        <th class="ps-0">Course Schedule</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${coursesHtml}
+                </tbody>
+            </table>
+        </div>
+    ` : `
+        <div class="text-center py-4">
+            <i class="bi bi-book" style="color: var(--text-muted); font-size: 3rem;"></i>
+            <p class="mt-2" style="color: var(--text-muted);">No courses assigned yet</p>
+        </div>
+    `;
+    
+    showCoursesModal();
 }
 
 // ==================== SEARCH FUNCTIONALITY ====================
@@ -598,21 +777,22 @@ function setupAlerts() {
 // ==================== CLICK OUTSIDE TO CLOSE MODALS ====================
 
 document.addEventListener('click', function(event) {
-    const addModal = document.getElementById('addFacultyModal');
-    const viewModal = document.getElementById('viewFacultyModal');
-    const coursesModal = document.getElementById('coursesModal');
+    const modals = ['addFacultyModal', 'viewFacultyModal', 'coursesModal', 'deleteConfirmModal'];
     
-    if (addModal.style.display === 'flex' && event.target === addModal) {
-        hideAddFacultyModal();
-    }
-    
-    if (viewModal.style.display === 'flex' && event.target === viewModal) {
-        hideViewFacultyModal();
-    }
-    
-    if (coursesModal.style.display === 'flex' && event.target === coursesModal) {
-        hideCoursesModal();
-    }
+    modals.forEach(modalId => {
+        const modal = document.getElementById(modalId);
+        if (modal && modal.style.display === 'flex' && event.target === modal) {
+            if (modalId === 'deleteConfirmModal') {
+                hideDeleteModal();
+            } else if (modalId === 'addFacultyModal') {
+                hideAddFacultyModal();
+            } else if (modalId === 'viewFacultyModal') {
+                hideViewFacultyModal();
+            } else if (modalId === 'coursesModal') {
+                hideCoursesModal();
+            }
+        }
+    });
 });
 
 // ==================== ESCAPE KEY TO CLOSE MODALS ====================
@@ -622,6 +802,7 @@ document.addEventListener('keydown', function(event) {
         hideAddFacultyModal();
         hideViewFacultyModal();
         hideCoursesModal();
+        hideDeleteModal();
     }
 });
 
@@ -633,9 +814,63 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 </script>
 
-<!-- Custom CSS for this page -->
+<!-- Custom CSS -->
 <style>
-/* Form controls styling */
+/* Modal Overlay */
+.modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.8);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Modal Container */
+.modal-container {
+    background: var(--card-bg);
+    border-radius: 20px;
+    width: 90%;
+    max-width: 500px;
+    border: 1px solid var(--border-color);
+    max-height: 90vh;
+    overflow-y: auto;
+}
+
+/* Modal Header */
+.modal-header {
+    padding: 1.25rem 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.modal-title {
+    margin: 0;
+    font-weight: bold;
+    color: var(--text-primary);
+}
+
+/* Modal Body */
+.modal-body {
+    padding: 1.5rem;
+}
+
+/* Modal Footer */
+.modal-footer {
+    padding: 1.25rem 1.5rem;
+    border-top: 1px solid var(--border-color);
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+/* Form controls */
 .form-control {
     background: var(--card-bg);
     border: 1px solid var(--border-color);
@@ -664,31 +899,58 @@ document.addEventListener('DOMContentLoaded', function() {
     margin-bottom: 8px;
     font-size: 0.9rem;
     display: block;
+    color: var(--text-secondary);
 }
 
-/* Modal styling */
-.btn-close-white {
-    background: transparent url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23ffffff'%3e%3cpath d='M.293.293a1 1 0 011.414 0L8 6.586 14.293.293a1 1 0 111.414 1.414L9.414 8l6.293 6.293a1 1 0 01-1.414 1.414L8 9.414l-6.293 6.293a1 1 0 01-1.414-1.414L6.586 8 .293 1.707a1 1 0 010-1.414z'/%3e%3c/svg%3e") center/1em auto no-repeat;
-    border: 0;
-    border-radius: 4px;
-    width: 1em;
-    height: 1em;
+/* Buttons */
+.btn {
+    border-radius: 10px;
+    font-weight: 500;
+    transition: all 0.2s;
     cursor: pointer;
+    padding: 10px 24px;
+    border: none;
 }
 
-/* Table hover effect */
+.btn-primary {
+    background: var(--sidebar-active);
+    color: white;
+}
+
+.btn-primary:hover {
+    background: var(--sidebar-active-light);
+    transform: translateY(-2px);
+}
+
+.btn-secondary {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+}
+
+.btn-secondary:hover {
+    background: var(--sidebar-hover);
+}
+
+.action-btn {
+    padding: 8px 12px !important;
+}
+
+.action-btn:hover {
+    transform: translateY(-2px);
+}
+
+/* Table */
 .table-hover tbody tr:hover {
     background: var(--sidebar-hover) !important;
 }
 
-/* Badge styling */
 .badge {
     font-weight: 500;
     padding: 6px 12px;
     border-radius: 30px;
 }
 
-/* User avatar in table */
 .user-avatar {
     width: 40px;
     height: 40px;
@@ -702,7 +964,6 @@ document.addEventListener('DOMContentLoaded', function() {
     overflow: hidden;
 }
 
-/* Status indicator */
 .user-status {
     display: inline-block;
     width: 8px;
@@ -717,12 +978,10 @@ document.addEventListener('DOMContentLoaded', function() {
     100% { opacity: 1; }
 }
 
-/* Alert styling */
 .alert {
     border: none;
     border-radius: 12px;
     padding: 1rem 1.5rem;
-    margin-bottom: 1rem;
 }
 
 .alert-success {
@@ -735,7 +994,6 @@ document.addEventListener('DOMContentLoaded', function() {
     color: #ef4444;
 }
 
-/* Search box */
 .search-box {
     background: var(--card-bg);
     border: 1px solid var(--border-color);
@@ -763,26 +1021,15 @@ document.addEventListener('DOMContentLoaded', function() {
     color: var(--text-muted);
 }
 
-/* Button styles */
-.btn {
-    border-radius: 10px;
-    font-weight: 500;
-    transition: all 0.2s;
+.btn-close-white {
+    background: transparent url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23ffffff'%3e%3cpath d='M.293.293a1 1 0 011.414 0L8 6.586 14.293.293a1 1 0 111.414 1.414L9.414 8l6.293 6.293a1 1 0 01-1.414 1.414L8 9.414l-6.293 6.293a1 1 0 01-1.414-1.414L6.586 8 .293 1.707a1 1 0 010-1.414z'/%3e%3c/svg%3e") center/1em auto no-repeat;
+    border: 0;
+    border-radius: 4px;
+    width: 1em;
+    height: 1em;
     cursor: pointer;
 }
 
-.btn-primary {
-    background: var(--sidebar-active);
-    border: none;
-    color: white;
-}
-
-.btn-primary:hover {
-    background: var(--sidebar-active-light);
-    transform: translateY(-2px);
-}
-
-/* Card styles */
 .card {
     background: var(--card-bg);
     border-radius: 16px;
@@ -801,7 +1048,6 @@ document.addEventListener('DOMContentLoaded', function() {
     padding: 1rem 1.5rem;
 }
 
-/* Responsive */
 @media (max-width: 768px) {
     .card-header {
         flex-direction: column;
@@ -815,6 +1061,11 @@ document.addEventListener('DOMContentLoaded', function() {
     
     .table {
         font-size: 0.85rem;
+    }
+    
+    .modal-container {
+        width: 95%;
+        margin: 20px;
     }
 }
 </style>

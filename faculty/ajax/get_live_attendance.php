@@ -1,65 +1,101 @@
 <?php
+// ajax/get_live_attendance.php
 session_start();
-require_once '../../config/db.php';
-require_once '../../config/constants.php';
+require_once '../config/db.php';
 
+// Set JSON header first
 header('Content-Type: application/json');
 
-if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'faculty') {
-    echo json_encode(['error' => 'Unauthorized']);
-    exit();
-}
-
-$faculty_id = $_SESSION['user_id'];
-$today = date('Y-m-d');
-
+// Error handling to catch any PHP errors
 try {
-    // Get today's attendance with location data
+    // Check if user is logged in and is faculty
+    if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'faculty') {
+        throw new Exception('Unauthorized access');
+    }
+
+    $faculty_id = $_SESSION['user_id'];
+    
+    // Get today's date
+    $today = date('Y-m-d');
+    
+    // First, get total students count for this faculty's courses
+    $stmt = $pdo->prepare("
+        SELECT COUNT(DISTINCT s.id) as total_students
+        FROM students s
+        WHERE s.role = 'student'
+        AND EXISTS (
+            SELECT 1 FROM schedule sch 
+            WHERE sch.faculty_id = ? 
+            AND sch.course_id = s.course_id 
+            AND sch.year_id = s.year_id
+        )
+    ");
+    $stmt->execute([$faculty_id]);
+    $total_students = $stmt->fetch(PDO::FETCH_ASSOC)['total_students'] ?? 0;
+    
+    // Fetch live attendance records for today
     $stmt = $pdo->prepare("
         SELECT 
             a.id,
             s.name as student_name,
             sub.subject_name,
             a.status,
-            TIME(a.created_at) as marked_time,
+            DATE_FORMAT(a.created_at, '%h:%i %p') as marked_time,
             a.distance_from_faculty,
-            a.failure_reason,
-            a.student_lat,
-            a.student_lng,
-            asess.allowed_radius
+            a.failure_reason
         FROM attendance a
         JOIN students s ON a.student_id = s.id
         JOIN subjects sub ON a.subjects_id = sub.id
-        JOIN schedule sch ON a.schedule_id = sch.id
-        LEFT JOIN attendance_sessions asess ON a.session_id = asess.id
-        WHERE sch.faculty_id = ? AND a.date = ?
+        WHERE a.faculty_id = ? AND a.date = ?
         ORDER BY a.created_at DESC
         LIMIT 50
     ");
+    
     $stmt->execute([$faculty_id, $today]);
     $attendance = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    // Get counts
+    // Count present for today
     $stmt = $pdo->prepare("
-        SELECT 
-            COUNT(DISTINCT s.id) as total_students,
-            SUM(CASE WHEN a.status = 'Present' AND a.date = ? THEN 1 ELSE 0 END) as present_count
-        FROM students s
-        LEFT JOIN attendance a ON s.id = a.student_id AND a.date = ?
-        WHERE s.role = 'student'
+        SELECT COUNT(*) as present_count 
+        FROM attendance 
+        WHERE faculty_id = ? AND date = ? AND status = 'Present'
     ");
-    $stmt->execute([$today, $today]);
-    $stats = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->execute([$faculty_id, $today]);
+    $present_count = $stmt->fetch(PDO::FETCH_ASSOC)['present_count'];
     
+    // Calculate attendance rate
+    $attendance_rate = $total_students > 0 
+        ? round(($present_count / $total_students) * 100, 1) 
+        : 0;
+    
+    // Return success response
     echo json_encode([
         'success' => true,
         'attendance' => $attendance,
-        'total_students' => $stats['total_students'] ?? 0,
-        'present_count' => $stats['present_count'] ?? 0,
-        'timestamp' => time()
+        'present_count' => (int)$present_count,
+        'total_students' => (int)$total_students,
+        'attendance_rate' => $attendance_rate,
+        'timestamp' => time(),
+        'date' => $today
     ]);
     
 } catch (PDOException $e) {
-    error_log("Live attendance error: " . $e->getMessage());
-    echo json_encode(['error' => 'Database error']);
+    // Database error
+    error_log("Database error in get_live_attendance.php: " . $e->getMessage());
+    echo json_encode([
+        'success' => false,
+        'error' => 'Database error occurred',
+        'attendance' => [],
+        'present_count' => 0
+    ]);
+} catch (Exception $e) {
+    // General error
+    error_log("Error in get_live_attendance.php: " . $e->getMessage());
+    echo json_encode([
+        'success' => false,
+        'error' => $e->getMessage(),
+        'attendance' => [],
+        'present_count' => 0
+    ]);
 }
+?>

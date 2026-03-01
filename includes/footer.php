@@ -1,7 +1,208 @@
 <?php
 // Make sure APP_URL is defined somewhere in your app
 ?>
+<style>/* ================= FOOTER ================= */
 
+.app-footer {
+    background: #0f172a;
+    color: #cbd5e1;
+    margin-left: 240px;
+    padding: 0;
+    border-top: 1px solid #1e293b;
+    font-size: 0.95rem;
+}
+
+/* Container */
+.footer-container {
+    max-width: 1400px;
+    margin: auto;
+    padding: 40px 28px 18px;
+}
+
+/* Top */
+.footer-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #1e293b;
+    padding-bottom: 20px;
+    margin-bottom: 28px;
+}
+
+/* Brand */
+.footer-brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-weight: 700;
+    color: #f1f5f9;
+}
+
+.footer-brand i {
+    font-size: 1.8rem;
+    color: #6366f1;
+}
+
+.brand-text span {
+    display: block;
+    font-size: 1.2rem;
+}
+
+.brand-text small {
+    color: #94a3b8;
+}
+
+/* Scroll top button */
+.scroll-top {
+    background: #6366f1;
+    border: none;
+    color: white;
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: .25s;
+}
+
+.scroll-top:hover {
+    transform: translateY(-3px);
+    background: #4f46e5;
+}
+
+/* Grid */
+.footer-main {
+    display: grid;
+    grid-template-columns: repeat(auto-fit,minmax(220px,1fr));
+    gap: 34px;
+    margin-bottom: 32px;
+}
+
+.footer-section h5 {
+    color: #f8fafc;
+    margin-bottom: 14px;
+    font-size: 1.05rem;
+}
+
+/* Links */
+.footer-links,
+.footer-contact {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.footer-links li,
+.footer-contact li {
+    margin-bottom: 10px;
+}
+
+.footer-links a {
+    color: #94a3b8;
+    text-decoration: none;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    transition: .2s;
+}
+
+.footer-links a:hover {
+    color: #6366f1;
+    transform: translateX(4px);
+}
+
+/* Contact */
+.footer-contact i {
+    margin-right: 8px;
+    color: #6366f1;
+}
+
+.footer-contact a {
+    color: #cbd5e1;
+    text-decoration: none;
+}
+
+/* Social */
+.footer-social {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.social-link {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    background: #1e293b;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #cbd5e1;
+    transition: .25s;
+}
+
+.social-link:hover {
+    background: #6366f1;
+    color: white;
+    transform: translateY(-3px);
+}
+
+/* Bottom */
+.footer-bottom {
+    border-top: 1px solid #1e293b;
+    padding-top: 16px;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.copyright {
+    color: #94a3b8;
+}
+
+.version {
+    margin-left: 10px;
+    background: #1e293b;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+}
+
+.footer-bottom-links a {
+    color: #94a3b8;
+    text-decoration: none;
+    margin: 0 6px;
+    transition: .2s;
+}
+
+.footer-bottom-links a:hover {
+    color: #6366f1;
+}
+
+.separator {
+    color: #475569;
+}
+
+/* MOBILE */
+@media (max-width: 991.98px) {
+    .app-footer {
+        margin-left: 0;
+    }
+
+    .footer-top {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+    }
+
+    .footer-bottom {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+}</style>
 </main> <!-- Close main-content from header -->
 
 <footer class="app-footer">

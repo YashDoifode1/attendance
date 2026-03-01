@@ -102,6 +102,11 @@ body {
             </a>
         </li>
         <li class="nav-item">
+            <a href="location.php" class="nav-link <?= basename($_SERVER['PHP_SELF'])=='location.php'?'active':'' ?>">
+                <i class="bi bi-qr-code-scan me-2"></i>Location Based Generate QR
+            </a>
+        </li>
+        <li class="nav-item">
             <a href="mark_attendance.php" class="nav-link <?= basename($_SERVER['PHP_SELF'])=='mark_attendance.php'?'active':'' ?>">
                 <i class="bi bi-pencil-square me-2"></i> Mark Attendance
             </a>

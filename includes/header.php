@@ -1,3 +1,6 @@
+
+
+
 <?php
 session_start();
 // if (!defined('APP_URL')) {
@@ -326,7 +329,12 @@ $current_page = basename($_SERVER['PHP_SELF']);
             <i class="bi bi-qr-code-scan"></i> Scan QR
         </a>
     </li>
-
+	 <li class="nav-item">
+        <a class="nav-link <?= $current_page == 'location_scan.php' ? 'active' : '' ?>" 
+           href="<?= APP_URL ?>/student/location_scan.php">
+            <i class="bi bi-qr-code-scan"></i> Scan QR Location
+        </a>
+    </li>
     <li class="nav-item">
         <a class="nav-link <?= $current_page == 'attendance_history.php' ? 'active' : '' ?>" 
            href="<?= APP_URL ?>/student/attendance_history.php">
